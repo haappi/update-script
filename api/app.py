@@ -1,14 +1,16 @@
 import hashlib
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Dict, List
 from fastapi.responses import FileResponse
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
-
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 
+cache = {}
 
 def calculate_md5(file_path):
     hasher = hashlib.md5()
@@ -18,19 +20,35 @@ def calculate_md5(file_path):
     return hasher.hexdigest()
 
 
-async def rename_stuff() -> int:
-    counter = 0
+async def rename_stuff() -> list[str]:
+    return_list = []
     for file_name in os.listdir('mods'):
         file_path = os.path.join('mods', file_name)
         if os.path.isfile(file_path):
             md5_hash = calculate_md5(file_path)
-            counter += 1
             try:
                 os.rename(file_path, os.path.join('hashed_mods', f"{md5_hash}-{file_name}"))
+                return_list.append(md5_hash)
             except FileExistsError:
                 os.remove(file_path)
 
-    return counter
+    return return_list
+
+
+async def get_delete_stuff() -> list[str]:
+    return_list = []
+    for file_name in os.listdir('deleted'):
+        print("aaaa")
+        file_path = os.path.join('deleted', file_name)
+        if os.path.isfile(file_path):
+            md5_hash = calculate_md5(file_path)
+            try:
+                os.rename(file_path, os.path.join('hashed_mods', f"{md5_hash}-{file_name}"))
+                return_list.append(md5_hash)
+            except FileExistsError:
+                os.remove(file_path)
+
+    return return_list
 
 
 @asynccontextmanager
@@ -70,6 +88,15 @@ def read_history_file(file_path: str) -> Dict[str, History]:
     return history_data
 
 
+def write_to_history(file_path: str, data: Dict[str, History]):
+    _json = {}
+    for key, value in data.items():
+        _json[key] = value.dict()
+    print(_json)
+    with open(file_path, 'w') as file:
+        json.dump(_json, file, indent=4)
+
+
 history: Dict[str, History] = read_history_file('history.json')
 
 password = "password"
@@ -81,8 +108,15 @@ async def reload_history(key: str):
         return HTTPException(status_code=403, detail="Invalid key")
     global history
     history = read_history_file('history.json')
-    new_added = await rename_stuff()
-    return {"message": "History reloaded", "added": f"{new_added} new mods added."}
+    added = await rename_stuff()
+    removed = await get_delete_stuff()
+    random_hash = hashlib.md5(os.urandom(32)).hexdigest()
+
+    history[random_hash] = History(timestamp=int(time.time()), added=added, removed=removed)
+
+    write_to_history('history.json', history)
+
+    return {"message": f"History reloaded. {len(added)} new mods added. {len(removed)} mods removed."}
 
 
 def get_latest_hash():
@@ -125,6 +159,12 @@ async def get_update(current_hash: str | None = None):
         added.update(history[_hash].added)
         removed.update(history[_hash].removed)
 
+    if not current_hash:
+        for item in removed:
+            if item in added:
+                added.remove(item)
+        removed = set()
+
     return {"added": added, "removed": removed, "latest_hash": get_latest_hash(),
             "message": f"Update fetched. {len(added)} mods added, {len(removed)} mods removed. "
                        f"You were {get_hash_count_behind(current_hash)} updates behind."}
@@ -135,10 +175,7 @@ async def download_mod(md5_hash: str):
     if len(md5_hash) != 32:
         return HTTPException(status_code=400, detail="Invalid hash")
     for file_name in os.listdir('hashed_mods'):
-        print(file_name)
-        print(file_name.split('-', 1)[1])
         if file_name.startswith(md5_hash):
-            print(file_name)
             return FileResponse(
                 os.path.join('hashed_mods', file_name),
                 media_type='application/octet-stream',
@@ -161,10 +198,30 @@ async def get_updater_update(current_hash: str):
     )
 
 
+"""
+todo
+
+
+automatically create a max 7z archive of the mods directory
+when downloading, check if its more perforamnt to
+- install each by hand
+- install and decompress the archive
+"""
+
+
 @app.get("/gami/friendly_name/{md5_hash}")
 async def get_friendly_name(md5_hash: str):
+    if md5_hash in cache:
+        cached_data, cached_timestamp = cache[md5_hash]
+        if datetime.utcnow() - cached_timestamp <= timedelta(minutes=60):
+            return cached_data
+
     for file_name in os.listdir('hashed_mods'):
         if file_name.startswith(md5_hash):
-            return PlainTextResponse(file_name.split('-', 1)[1])
+            friendly_name = file_name.split('-', 1)[1]
+            response = PlainTextResponse(friendly_name)
+            response.headers["Cache-Control"] = "max-age=3600"
+            cache[md5_hash] = (response, datetime.utcnow())
+            return response
 
-    return HTTPException(status_code=404, detail="File not found. Contact haappi")
+    raise HTTPException(status_code=404, detail="File not found. Contact haappi")

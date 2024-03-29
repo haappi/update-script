@@ -7,8 +7,10 @@ import asyncio
 import hashlib
 import os
 import aiofiles
+from tqdm import tqdm
 
-API_URL: Final[str] = "https://chicago.quack.boo/gami/"
+API_URL: Final[str] = "https://staging.quack.boo/gami/"
+# API_URL: Final[str] = "http://localhost:8000/gami/"
 
 
 def print_fail(message, end='\n'):
@@ -29,8 +31,6 @@ def print_info(message, end='\n'):
 
 def print_bold(message, end='\n'):
     sys.stdout.write('\x1b[1;37m' + message.strip() + '\x1b[0m' + end)
-
-
 
 
 def calculate_md5(file_path):
@@ -82,15 +82,15 @@ async def fetch_latest_hash(session):
 
 
 async def get_friendly_name(session, file_name):
-    async with session.get(API_URL + file_name) as response:
+    async with session.get(API_URL + f"friendly_name/{file_name}") as response:
         if response.status == 200:
             return await response.text()
         else:
-            return file_name
+            raise Exception(f"Failed to fetch friendly name for '{file_name}'")
 
 
 async def fetch_affected_files(session, current_hash):
-    async with session.get(API_URL + current_hash) as response:
+    async with session.get(API_URL + f"update/{current_hash}") as response:
         if response.status == 200:
             _json = await response.json()
             print_warn(_json["message"])
@@ -99,8 +99,8 @@ async def fetch_affected_files(session, current_hash):
             return None
 
 
-async def download_file(session, file_name):
-    async with session.get(API_URL + file_name) as response:
+async def download_file(session, file_name, progress_bar, overall_progress_bar):
+    async with session.get(API_URL + f"download/{file_name}") as response:
         if response.status == 200:
             content_disposition = response.headers.get('Content-Disposition')
             if content_disposition:
@@ -108,17 +108,18 @@ async def download_file(session, file_name):
                 server_file_name = params.get('filename')
                 if server_file_name:
                     file_name = server_file_name
-
-            file_size = int(response.headers.get('Content-Length', 0))
+                else:
+                    file_name = await get_friendly_name(session, file_name)
             downloaded = 0
             async with aiofiles.open(file_name, 'wb') as f:
                 async for chunk in response.content.iter_chunked(1024):
                     await f.write(chunk)
                     downloaded += len(chunk)
-                    print(f"Downloading {file_name}: {downloaded}/{file_size} bytes", end='\r')
-            print(f"Downloading {file_name}: Done")
+                    progress_bar.update(len(chunk))
+            progress_bar.close()
+            overall_progress_bar.update(1)
         else:
-            print(f"Failed to download {file_name}")
+            raise Exception(f"Failed to download file '{file_name}'")
 
 
 def update_current_hash(latest_hash):
@@ -126,13 +127,13 @@ def update_current_hash(latest_hash):
 
 
 async def main():
-    deletedDirectory = "deletedModsByHappy"
+    deleted_directory = "deletedModsByHappy"
 
     try:
-        os.makedirs(deletedDirectory)
-        print_info(f"Directory '{deletedDirectory}' created successfully.")
+        os.makedirs(deleted_directory)
+        print_info(f"Directory '{deleted_directory}' created successfully.")
     except FileExistsError:
-        print_info(f"Directory '{deletedDirectory}' already exists. Skipping creation.")
+        print_info(f"Directory '{deleted_directory}' already exists. Skipping creation.")
 
     current_hash = load_string_from_file('hash.txt') if os.path.exists('hash.txt') else ""
 
@@ -145,18 +146,22 @@ async def main():
 
             if affected_files:
                 tasks = []
+                overall_progress_bar = tqdm(total=len(affected_files['added']), unit=' file', desc="Overall Progress", leave=False)
                 for file_name in affected_files['added']:
+                    friendly_name = await get_friendly_name(session, file_name)
                     if file_name in already_existing:
-                        print_warn(f"File '{file_name}' already exists. Skipping download.")
+                        print_warn(f"File '{friendly_name}' already exists. Skipping download.")
+                        overall_progress_bar.update(1)
                         continue
-                    tasks.append(download_file(session, file_name))
+                    progress_bar = tqdm(total=100, unit='B', unit_scale=True, desc=friendly_name, leave=False)
+                    tasks.append(download_file(session, file_name, progress_bar, overall_progress_bar))
                 await asyncio.gather(*tasks)
 
                 for file_name in affected_files['removed']:
                     file_name = await get_friendly_name(session, file_name)
                     try:
-                        os.rename(file_name, os.path.join(deletedDirectory, file_name))
-                        print_pass(f"File '{file_name}' moved to '{deletedDirectory}'.")
+                        os.rename(file_name, os.path.join(deleted_directory, file_name))
+                        print_pass(f"File '{file_name}' moved to '{deleted_directory}'.")
                     except FileNotFoundError or FileExistsError:
                         print_fail(f"File '{file_name}' not found. Skipping deletion.")
 
